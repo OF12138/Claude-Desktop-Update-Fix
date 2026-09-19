@@ -1,41 +1,55 @@
-# Claude Desktop Update Fix
+# MSIX Update Fix for Claude Desktop, Codex and other apps
 
-Fixes the **MSIX build of Claude Desktop** on Windows when it quits by itself and then
-refuses to start again until you reboot.
+Fixes Windows desktop apps distributed as **MSIX packages that include their own
+Windows service** when their self-update gets stuck, and a reboot is the only thing that
+brings them back. Confirmed with:
 
-- `Repair-ClaudeStuckUpdate.ps1` gets Claude running again in a few seconds, with no reboot.
-- `Install-AutoRepair.ps1` sets up a scheduled task that does this for you every time it happens.
+| App | Packaged service |
+|---|---|
+| Claude Desktop (Anthropic) | `CoworkVMService` |
+| Codex (OpenAI) | `CodexSandboxService.OpenAI.Codex` |
+
+The fix is generic: it handles any MSIX packaged service stuck in this state.
+
+- `Repair-StuckMsixUpdate.ps1` gets the app updated and running again within seconds,
+  with no reboot.
+- `Install-AutoRepair.ps1` installs a scheduled task that runs the repair automatically
+  every time this happens.
 
 ---
 
 ## Symptom
 
-- Claude Desktop is open and idle. At some point it closes on its own.
-- Clicking the Claude icon, the Start menu entry or the taskbar pin does nothing. No
-  window appears and no error is shown.
-- Rebooting fixes it, and Claude comes back with a newer version.
-- A few days later it happens again.
+One of these, and a reboot fixes both:
+
+- **Claude Desktop** closes by itself while you are idle. After that, clicking its icon
+  does nothing: no window opens and no error is shown.
+- **Codex** restarts to install an update, but no window comes back. If you start it
+  by hand it opens, but it is still the old version and the update never completes.
+
+In both cases the same thing happens again a few days later, with the next update.
 
 ## What is actually going on
 
-### 1. The "crash" is a silent self-update
+The diagnosis below uses Claude Desktop. Codex produced exactly the same event sequence,
+with the same 65-second gap.
 
-Claude Desktop installs updates in the background. After downloading one, it waits
-until you are idle, then quits so that Windows can swap the package. From
+### 1. The app quits to update itself
+
+Claude Desktop installs updates silently. After downloading one, it waits until you are
+idle, then quits so that Windows can swap the package. From
 `%LOCALAPPDATA%\Claude\logs\main.log`:
 
 ```
 [updater] Update downloaded and ready to install { releaseName: 'Claude 2.2553.0' }
-...
 [stealth-update] Triggering stealth update after idle timeout
 beforeQuitForUpdate handler fired, going down for update
 ```
 
 ### 2. The update fails deleting the old Windows service
 
-The MSIX package contains a Windows service, `CoworkVMService` (`cowork-svc.exe`,
-which runs the Cowork virtual machine). An update has to delete the old version's
-service before it can register the new one. From
+Both apps ship a Windows service inside the MSIX package. An update has to delete the
+old version's service before it can register the new one. From
 `Microsoft-Windows-AppXDeploymentServer/Operational`:
 
 ```
@@ -53,17 +67,17 @@ the service entry itself to disappear.
 
 ### 3. The service is left "marked for deletion"
 
-The Windows Service Control Manager cannot delete a service while any process
-still holds an open handle to it. Instead it marks the service for deletion, and the
-service disappears only when the last handle is closed:
+The Windows Service Control Manager cannot delete a service while any process still
+holds an open handle to it. Instead it marks the service for deletion, and the service
+disappears only when the last handle is closed:
 
 ```
 HKLM\SYSTEM\CurrentControlSet\Services\CoworkVMService
     DeleteFlag    REG_DWORD    0x1
 ```
 
-From that point on, every launch of Claude makes Windows retry the pending update first,
-and every retry fails straight away:
+From then on, every launch of the app makes Windows retry the pending update first, and
+every retry fails straight away:
 
 ```
 404  AppX Deployment operation failed for package Claude_2.2553.0.0_x64__pzs8sxrjxfjjc
@@ -71,29 +85,30 @@ and every retry fails straight away:
      to be closed.
 ```
 
-`0x80070430` is `ERROR_SERVICE_MARKED_FOR_DELETE`. Claude never gets started.
+`0x80070430` is `ERROR_SERVICE_MARKED_FOR_DELETE`. Claude Desktop then does not start
+at all. Codex starts, but only on the old version.
 
 ### 4. Why a reboot fixes it
 
 A reboot closes every handle. The service is deleted during boot, and the next launch
-completes the update. On the machine this was diagnosed on, the pattern was:
-update stuck at 14:26, reboot at 22:49, new service installed at 22:50.
+completes the update.
 
 ### 5. Who holds the handle
 
 On the machine this was diagnosed on it was **Honor PC Manager** (荣耀电脑管家, service
 `MBAMainService`, together with its `HnPerformanceCenter` / `HnPerfPowerNexus` processes).
-Restarting that service released the handle immediately. Five seconds later Claude had
-updated and was running.
+Restarting that service released the handle immediately, for Claude and for Codex. Five
+seconds later the app had updated and was running. Two unrelated apps from two vendors
+failing the same way points at the machine, not at either app.
 
 Why a system utility would do this is an inference, because the software is closed
 source. Tools that watch services typically use `NotifyServiceStatusChange`, which keeps
 a handle open to every service being monitored. The API documentation says that when the
 caller receives `SERVICE_NOTIFY_DELETE_PENDING` it must close that handle, or the service
 cannot be deleted. A monitor that misses this blocks the deletion until it is restarted.
-`CoworkVMService` is an auto-start `LocalSystem` service that gets reinstalled on every
-Claude update, which makes it exactly the kind of service security, optimiser and
-performance tools watch.
+Packaged services are reinstalled on every app update, and they are often auto-start
+`LocalSystem` services, which makes them exactly the kind of service that security,
+optimiser and performance tools watch.
 
 **On your machine the culprit may be different.** The repair script tries the likely
 holders one by one and logs which step worked (see below).
@@ -103,12 +118,22 @@ handle. These are RPC context handles inside `services.exe`, so neither Process 
 nor `handle.exe` shows them. Releasing candidates one at a time and watching `DeleteFlag`
 is the practical way to find the holder.
 
+### Check whether you are affected
+
+```powershell
+Get-ChildItem HKLM:\SYSTEM\CurrentControlSet\Services | ForEach-Object {
+    $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+    if ($p.DeleteFlag -eq 1 -and $p.PackageFullName) { "$($_.PSChildName)  ->  $($p.PackageFullName)" }
+}
+```
+
+Any output means a packaged service is stuck and that app's update cannot complete.
+
 ---
 
 ## Requirements
 
-- Windows 10 / 11 with the **MSIX** build of Claude Desktop
-  (`Get-AppxPackage -Name Claude` returns a package)
+- Windows 10 / 11
 - An elevated PowerShell session
 
 ## Fix it now
@@ -118,16 +143,17 @@ Open PowerShell with **Run as administrator**:
 ```powershell
 git clone https://github.com/OF12138/Claude-Desktop-Update-Fix.git
 cd Claude-Desktop-Update-Fix
-powershell -ExecutionPolicy Bypass -File .\Repair-ClaudeStuckUpdate.ps1
+powershell -ExecutionPolicy Bypass -File .\Repair-StuckMsixUpdate.ps1
 ```
 
-If `CoworkVMService` has no `DeleteFlag`, the script says so and exits without changing
-anything. Otherwise it tries these steps in order, from least to most disruptive. After
-each step it checks whether the service is gone:
+The script finds every packaged service with `DeleteFlag=1`. If there are none, it says
+so and exits without changing anything. Otherwise it tries these steps in order, from
+least to most disruptive, and after each step checks whether all the stuck services are
+gone:
 
 | # | Step |
 |---|------|
-| 1 | Kill leftover processes from the Claude package |
+| 1 | Kill leftover processes from the affected packages |
 | 2 | Honor PC Manager: restart `MBAMainService` (skipped if not installed) |
 | 3 | Honor PC Manager: kill `HnPerformanceCenter`, `HnPerfPowerNexus` |
 | 4 | Close Task Manager, `services.msc`, Process Explorer (manual runs only) |
@@ -136,16 +162,19 @@ each step it checks whether the service is gone:
 | 7 | `-IncludeDisruptive` only: restart WSL + `vmcompute` (stops running WSL/Docker/Hyper-V VMs) |
 | 8 | `-IncludeDisruptive` only: restart `StateRepository` (Start menu may flicker) |
 
-When the service is gone, the script launches Claude, which completes the pending update.
-Everything is written to `repair.log`, including the line that tells you who the
-culprit was:
+When the services are gone, the script launches each affected app. It uses the
+`AppUserModelId` recorded in the service's registry key, or the package manifest if that
+value is missing. Launching the app makes Windows complete the pending update. The script
+then waits until the new version is installed and running. Everything goes to
+`repair.log`, including a `RELEASED BY` line that names the culprit. Example:
 
 ```
+STUCK: CodexSandboxService.OpenAI.Codex  (package OpenAI.Codex_26.915.3509.0_x64__2p2nqsd0c76g0)
 STEP: Honor PC Manager: restart service MBAMainService
   restarted service MBAMainService
 RELEASED BY: Honor PC Manager: restart service MBAMainService
-installed package now: Claude_2.2553.0.0_x64__pzs8sxrjxfjjc
-Claude is running.
+Launching OpenAI.Codex_2p2nqsd0c76g0!App to complete the pending update ...
+  OpenAI.Codex: 26.915.3509.0 -> 26.915.4065.0
 ```
 
 If none of the steps works, run it again with `-IncludeDisruptive`, or reboot.
@@ -168,17 +197,19 @@ $KnownHolderServices = @(
 powershell -ExecutionPolicy Bypass -File .\Install-AutoRepair.ps1
 ```
 
-This registers a scheduled task named `ClaudeAutoHeal`. It is triggered by event
-**9628** in `Microsoft-Windows-AppXDeploymentServer/Operational`, which is logged exactly
-when a Claude update fails to delete `CoworkVMService`. The task runs
-`Repair-ClaudeStuckUpdate.ps1 -Unattended`. That releases the service using only the
-non-disruptive steps and relaunches Claude. After an automatic update you get Claude
-back within about two minutes, without doing anything.
+This registers a scheduled task named `MsixStuckUpdateAutoRepair`. It is triggered by
+event **9628** in `Microsoft-Windows-AppXDeploymentServer/Operational`, which Windows
+logs exactly when an MSIX update fails to delete a packaged service, whichever app it
+belongs to. The task runs `Repair-StuckMsixUpdate.ps1 -Unattended`. That releases the
+service using only the non-disruptive steps and relaunches the app. After an automatic
+update you get the app back within about two minutes, without doing anything.
 
-- Script location: `%ProgramData%\ClaudeAutoHeal\`. It is locked so that only
-  administrators can modify it, because the task runs elevated.
-- Log: `%ProgramData%\ClaudeAutoHeal\heal.log`
+- Script location: `%ProgramData%\MsixStuckUpdateAutoRepair\`. It is locked so that
+  only administrators can modify it, because the task runs elevated.
+- Log: `%ProgramData%\MsixStuckUpdateAutoRepair\repair.log`
 - Remove: `.\Install-AutoRepair.ps1 -Uninstall`
+- Upgrading from the earlier Claude-only version: just run the installer. It removes the
+  old `ClaudeAutoHeal` task and folder.
 
 ### Does the task cost anything?
 
@@ -187,34 +218,36 @@ back within about two minutes, without doing anything.
   against events written to that one channel. That is a single integer comparison per
   event, and on the test machine the channel received about 900 events a day, almost all
   in the few seconds around app installs.
-- **How often it fires:** only on a stuck Claude update. Event 9628 appeared exactly
-  twice in the test machine's log, once per incident.
-- **When it fires:** it reads one registry value and exits immediately if nothing is
-  stuck. Otherwise it spends up to about 45 seconds waiting for the handle to be
-  released, checking every 0.5 seconds, and then up to 2 minutes waiting for Claude to
-  start. The CPU is essentially idle during these waits.
+- **How often it fires:** only on a stuck update. On the test machine event 9628
+  appeared three times in total: twice for Claude, once for Codex.
+- **When it fires:** it scans the service keys in the registry and exits immediately if
+  nothing is stuck. Otherwise it spends up to about a minute waiting for the handle to
+  be released, checking every 0.5 seconds, and then up to 2 minutes per app waiting for
+  it to update and start. The CPU is essentially idle during these waits.
 
 ### Does it affect Honor PC Manager?
 
 Only when it fires. `MBAMainService` is restarted and brings its helper processes back
 by itself within about a second. Its other processes (tray UI, cloud service, update
-service) are not touched. Afterwards Honor PC Manager runs normally, and so does Claude.
-The two programs do not depend on each other.
+service) are not touched. Afterwards Honor PC Manager runs normally, and so do the
+repaired apps. None of them depend on each other.
 
 ## Related
 
-- The update also resets Claude's low-resolution taskbar icon. See
+- Every Claude Desktop update also resets its low-resolution taskbar icon. See
   [ClaudeDesktopIconFix](https://github.com/OF12138/ClaudeDesktopIconFix), which can
   re-apply its fix automatically after every update.
-- If you moved `vm_bundles` to another drive with a junction: `cowork-svc` runs as
-  `LocalSystem` and deliberately refuses to follow junctions
-  (`vm_bundles is a symlink or junction, refusing to open` in `main.log`). Cowork will
-  not start that way. This is unrelated to the update problem.
+- Claude Cowork and `vm_bundles` junctions: `cowork-svc` runs as `LocalSystem` and
+  deliberately refuses to follow junctions, symlinks and hard links
+  (`vm_bundles is a symlink or junction, refusing to open` in `main.log`). This is to
+  stop a user-level process from redirecting its SYSTEM-level writes. Moving
+  `vm_bundles` to another drive with a junction therefore disables Cowork. This is
+  unrelated to the update problem.
 
 ## Disclaimer
 
-This is an unofficial community fix. It is not affiliated with or endorsed by Anthropic
-or Honor. Use at your own risk.
+This is an unofficial community fix. It is not affiliated with or endorsed by Anthropic,
+OpenAI or Honor. Use at your own risk.
 
 ## License
 
