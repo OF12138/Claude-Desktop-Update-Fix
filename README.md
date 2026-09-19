@@ -95,11 +95,20 @@ completes the update.
 
 ### 5. Who holds the handle
 
-On the machine this was diagnosed on it was **Honor PC Manager** (荣耀电脑管家, service
-`MBAMainService`, together with its `HnPerformanceCenter` / `HnPerfPowerNexus` processes).
-Restarting that service released the handle immediately, for Claude and for Codex. Five
-seconds later the app had updated and was running. Two unrelated apps from two vendors
-failing the same way points at the machine, not at either app.
+On the machine this was diagnosed on it was **Honor PC Manager** (荣耀电脑管家), more
+precisely one of its performance-management processes, **`HnPerformanceCenter` or
+`HnPerfPowerNexus`**:
+
+- For Claude, restarting its main service `MBAMainService` released the handle. That
+  restart also restarted both `HnPerf*` processes.
+- For Codex, restarting `MBAMainService` did **not** help. This time the `HnPerf*`
+  processes were not restarted, because they are supervised by a separate watchdog,
+  `MBAProcessWatcher.exe`, which kept running. Killing the two `HnPerf*` processes
+  released the handle immediately, and the watchdog started them again in the same
+  second.
+
+Two unrelated apps from two vendors failing the same way points at the machine, not at
+either app.
 
 Why a system utility would do this is an inference, because the software is closed
 source. Tools that watch services typically use `NotifyServiceStatusChange`, which keeps
@@ -154,28 +163,46 @@ gone:
 | # | Step |
 |---|------|
 | 1 | Kill leftover processes from the affected packages |
-| 2 | Honor PC Manager: restart `MBAMainService` (skipped if not installed) |
-| 3 | Honor PC Manager: kill `HnPerformanceCenter`, `HnPerfPowerNexus` |
+| 2 | Honor PC Manager: kill `HnPerformanceCenter`, `HnPerfPowerNexus` (restarted by its watchdog at once) |
+| 3 | Honor PC Manager: restart `MBAMainService` (skipped if not installed) |
 | 4 | Close Task Manager, `services.msc`, Process Explorer (manual runs only) |
 | 5 | Restart `AppXSvc` |
 | 6 | Restart WMI (`Winmgmt`) |
 | 7 | `-IncludeDisruptive` only: restart WSL + `vmcompute` (stops running WSL/Docker/Hyper-V VMs) |
 | 8 | `-IncludeDisruptive` only: restart `StateRepository` (Start menu may flicker) |
 
-When the services are gone, the script launches each affected app. It uses the
-`AppUserModelId` recorded in the service's registry key, or the package manifest if that
-value is missing. Launching the app makes Windows complete the pending update. The script
-then waits until the new version is installed and running. Everything goes to
-`repair.log`, including a `RELEASED BY` line that names the culprit. Example:
+When the services are gone, the script completes each pending update itself:
+
+1. It looks up the version the update was trying to install. Event 855 in the deployment
+   log records every attempt as `<old package> is updating to <new package>`.
+2. It registers that already-downloaded package with
+   `Add-AppxPackage -Register -MainPackage <new package> -ForceApplicationShutdown`.
+   This step matters. Claude retries the registration by itself when it is launched,
+   but Codex only registers from its own updater. Launching Codex after the release
+   merely starts the old version again, and the update never completes.
+3. It launches the app, using the `AppUserModelId` recorded in the service's registry
+   key or the package manifest, and waits until the new version is running.
+
+Everything goes to `repair.log`, including a `RELEASED BY` line that names the culprit.
+From the Codex incident:
 
 ```
 STUCK: CodexSandboxService.OpenAI.Codex  (package OpenAI.Codex_26.915.3509.0_x64__2p2nqsd0c76g0)
+STEP: Leftover processes from the affected packages
+  no leftover process from the affected packages
+  -> still stuck
 STEP: Honor PC Manager: restart service MBAMainService
   restarted service MBAMainService
-RELEASED BY: Honor PC Manager: restart service MBAMainService
-Launching OpenAI.Codex_2p2nqsd0c76g0!App to complete the pending update ...
-  OpenAI.Codex: 26.915.3509.0 -> 26.915.4065.0
+  -> still stuck
+STEP: Honor PC Manager: kill HnPerformanceCenter, HnPerfPowerNexus
+  killed HnPerformanceCenter (pid 7048)
+  killed HnPerfPowerNexus (pid 21060)
+RELEASED BY: Honor PC Manager: kill HnPerformanceCenter, HnPerfPowerNexus
 ```
+
+The step order shown there is from before the `HnPerf*` step was moved to the front. In
+that run the update was then completed by registering
+`OpenAI.Codex_26.915.4065.0_x64__2p2nqsd0c76g0` as described above.
 
 If none of the steps works, run it again with `-IncludeDisruptive`, or reboot.
 
@@ -227,9 +254,12 @@ update you get the app back within about two minutes, without doing anything.
 
 ### Does it affect Honor PC Manager?
 
-Only when it fires. `MBAMainService` is restarted and brings its helper processes back
-by itself within about a second. Its other processes (tray UI, cloud service, update
-service) are not touched. Afterwards Honor PC Manager runs normally, and so do the
+Only when it fires. The first thing it does is kill `HnPerformanceCenter` and
+`HnPerfPowerNexus`. Honor's watchdog `MBAProcessWatcher.exe` starts them again within
+the same second, so performance management pauses for about a second. The script
+restarts `MBAMainService` only if that was not enough, and that restart also takes
+about a second. Honor PC Manager's other processes (tray UI, cloud service, update
+service) are never touched. Afterwards Honor PC Manager runs normally, and so do the
 repaired apps. None of them depend on each other.
 
 ## Related

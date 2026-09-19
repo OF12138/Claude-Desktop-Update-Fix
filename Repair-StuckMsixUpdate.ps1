@@ -50,6 +50,7 @@ if (-not $LogPath) { $LogPath = Join-Path $PSScriptRoot 'repair.log' }
 # Third-party services known to hold the handle. Add yours here once the log has told
 # you which one it is.
 $KnownHolderServices = @(
+    # Holder confirmed as HnPerformanceCenter / HnPerfPowerNexus; MBAProcessWatcher restarts them within a second.
     @{ Service = 'MBAMainService'; Label = 'Honor PC Manager'; Processes = @('HnPerformanceCenter', 'HnPerfPowerNexus') }
 )
 
@@ -125,6 +126,17 @@ function Get-InstalledVersion([string]$PackageName) {
     if ($pkg) { [string]$pkg.Version }
 }
 
+function Get-PendingTargetPackage([string]$OldFullName) {
+    # Event 855 records every update attempt as "<old full name> is updating to <new full name>".
+    $pattern = [regex]::Escape($OldFullName) + ' is updating to (\S+?)\.?(\s|$)'
+    $events = Get-WinEvent -LogName 'Microsoft-Windows-AppXDeploymentServer/Operational' `
+        -FilterXPath '*[System[(EventID=855)]]' -MaxEvents 500 -ErrorAction SilentlyContinue
+    foreach ($e in $events) {   # newest first
+        $m = [regex]::Match($e.Message, $pattern)
+        if ($m.Success) { return $m.Groups[1].Value }
+    }
+}
+
 function Get-LaunchAumid($Stuck) {
     if ($Stuck.Aumid) { return $Stuck.Aumid }
     $pkg = Get-AppxPackage -Name $Stuck.PackageName -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -157,12 +169,14 @@ $steps = [System.Collections.Generic.List[hashtable]]::new()
 $steps.Add(@{ Name = 'Leftover processes from the affected packages'; Arg = $packageNames
               Run  = { param($a) Stop-PackageProcesses $a } })
 foreach ($h in $KnownHolderServices) {
-    $steps.Add(@{ Name = "$($h.Label): restart service $($h.Service)"; Arg = $h.Service
-                  Run  = { param($a) Restart-ServiceIfRunning $a } })
+    # Killing the helper processes first: the vendor's watchdog restarts them at once,
+    # which is less disruptive than restarting the whole service.
     if ($h.Processes) {
         $steps.Add(@{ Name = "$($h.Label): kill $($h.Processes -join ', ')"; Arg = $h.Processes
                       Run  = { param($a) Stop-ProcessesByName $a } })
     }
+    $steps.Add(@{ Name = "$($h.Label): restart service $($h.Service)"; Arg = $h.Service
+                  Run  = { param($a) Restart-ServiceIfRunning $a } })
 }
 if (-not $Unattended) {
     $steps.Add(@{ Name = 'Service management tools (Task Manager, services.msc, Process Explorer)'
@@ -194,12 +208,23 @@ if (-not $releasedBy) {
 }
 Log "RELEASED BY: $releasedBy" 'Green'
 
-# Launching each app retries its pending package registration and completes the update.
 foreach ($s in $stuck) {
+    # Complete the pending update by registering the already-staged new version.
+    # Some apps (Claude) also retry this themselves on launch; others (Codex) only do it
+    # from their own updater, so launching alone would just start the old version.
+    $target = Get-PendingTargetPackage $s.PackageFullName
+    if ($target -and $target -ne (Get-AppxPackage -Name $s.PackageName | Select-Object -First 1).PackageFullName) {
+        Log "Registering pending update $target ..." 'Cyan'
+        try   { Add-AppxPackage -Register -MainPackage $target -ForceApplicationShutdown -ErrorAction Stop; Log '  registered' 'Green' }
+        catch { Log "  register failed: $($_.Exception.Message)" 'Yellow' }
+    } else {
+        Log "  no pending update found for $($s.PackageFullName) in the deployment log"
+    }
+
     $aumid = Get-LaunchAumid $s
     if (-not $aumid) { Log "  cannot determine how to launch $($s.PackageName); start it manually" 'Yellow'; continue }
 
-    Log "Launching $aumid to complete the pending update ..." 'Cyan'
+    Log "Launching $aumid ..." 'Cyan'
     if (-not (Get-PackageProcesses $s.PackageName)) { Start-Process explorer.exe "shell:AppsFolder\$aumid" }
 
     for ($i = 0; $i -lt 60; $i++) {
