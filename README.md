@@ -264,9 +264,11 @@ repaired apps. None of them depend on each other.
 
 ## Related
 
-- Every Claude Desktop update also resets its low-resolution taskbar icon. See
-  [ClaudeDesktopIconFix](https://github.com/OF12138/ClaudeDesktopIconFix), which can
-  re-apply its fix automatically after every update.
+- Claude Desktop before 2.9939.2.0 shipped a 24x24 taskbar icon that looked blurry on a
+  high-DPI display; 2.9939.2.0 fixed that and changed the artwork from a transparent
+  star glyph to an opaque rounded square. Either way, every update resets the icon. See
+  [ClaudeDesktopIconFix](https://github.com/OF12138/ClaudeDesktopIconFix), which writes
+  the artwork of your choice and can re-apply it automatically after every update.
 - Claude Cowork and `vm_bundles` junctions: `cowork-svc` runs as `LocalSystem` and
   deliberately refuses to follow junctions, symlinks and hard links
   (`vm_bundles is a symlink or junction, refusing to open` in `main.log`). This is to
